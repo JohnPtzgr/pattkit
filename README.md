@@ -1,0 +1,1 @@
+PattKit - is a toolkit to develop compiled programming languages using simple patterns for both grammar and code-gen step, while also benefitting from the ability to use numerous AST tools, interchangeable (to a certain degree) between any two PLs created with this toolkit.
