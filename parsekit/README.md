@@ -1,8 +1,7 @@
 # parsekit
 
 A universal parser "source + grammar → AST": a two-pass lexer, bottom-up rewriting of the token
-list by layers, a name table, an operator table, and a separate error-recovery layer. Standard
-library only, Python 3.9+.
+list by layers, a name table, an operator table, and a separate error-recovery layer.
 
 ```
 Text  ─► Pass 1 (coarse tokens) ─► Pass 2 (context: comments, string, f-strings,
