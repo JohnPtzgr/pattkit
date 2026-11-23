@@ -1,0 +1,92 @@
+# ============================================================================
+# pattkit/codegen/patterns/c_base.cgen
+# Standard C codegen patterns. Load this first, then override selectively.
+# ============================================================================
+
+# ---- expressions -----------------------------------------------------------
+
+BIdentifier(name):
+    emit "${name}"
+
+BLiteral(value):
+    emit "${value}"
+
+BBinaryOp(left, op, right):
+    emit "(${left} ${op} ${right})"
+
+BUnaryOp(op, operand, is_prefix):
+    if is_prefix:
+        emit "(${op}${operand})"
+    else:
+        emit "(${operand}${op})"
+
+BCallExpr(callee, args):
+    emit "${callee}(${args})"
+
+BMemberExpr(object, member):
+    emit "${object}.${member}"
+
+BIndexExpr(object, index):
+    emit "${object}[${index}]"
+
+# ---- statements ------------------------------------------------------------
+
+BBlock(stmts):
+    emit "{"
+    indent
+    for stmt in stmts:
+        emit "${stmt}"
+    dedent
+    emit "}"
+
+BExprStmt(expr):
+    emit "${expr};"
+
+BReturnStmt(value):
+    if value is None:
+        emit "return;"
+    else:
+        emit "return ${value};"
+
+BIfStmt(cond, then_body, else_body):
+    emit "if (${cond}) ${then_body}"
+    if else_body is not None:
+        emit "else ${else_body}"
+
+BWhileStmt(cond, body):
+    emit "while (${cond}) ${body}"
+
+BForStmt(init, cond, step, body):
+    emit "for (${init | trim}; ${cond}; ${step | trim}) ${body}"
+
+# ---- declarations ----------------------------------------------------------
+
+BVarDecl(name, type_hint, value, is_const):
+    let ty = ctype(type_hint)
+    let q = "const " if is_const else ""
+    if value is None:
+        emit "${q}${ty} ${name};"
+    else:
+        emit "${q}${ty} ${name} = ${value};"
+
+BParamDecl(name, type_hint):
+    emit "${ctype(type_hint)} ${name}"
+
+BFuncDecl(name, params, return_type, body):
+    let rt = ctype(return_type, "void")
+    let ps = join(params) or "void"
+    let sym = mangle(name)
+    header "${rt} ${sym}(${ps});"
+    if body is None:
+        pass
+    else:
+        emit "${rt} ${sym}(${ps}) { ${body}; }"
+
+# ---- types -----------------------------------------------------------------
+
+BTypeRef(name):
+    emit "${ctype(name)}"
+
+BGenericInst(base, args):
+    # C has no generics; fall back to a macro-style expansion.
+    emit "${base}_${args | join('_')}"
