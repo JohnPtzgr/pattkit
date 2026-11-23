@@ -183,6 +183,10 @@ class Recovery:
                     if kind == "rules":
                         for r in obj:
                             walk(r.pat)
+                    elif kind == "peg":
+                        for alts in obj.peg_rules.values():
+                            for _, pat in alts:
+                                walk(pat)
                     else:
                         for _, ops in obj.levels:
                             out |= set(ops)

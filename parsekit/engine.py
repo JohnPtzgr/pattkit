@@ -6,11 +6,16 @@ Grammar file
     names IDENTIFIER              # token types the name table may re-classify
     unknown UNKNOWN               # (optional) class given to names missing from the table
     stops ";" "{" "}"             # a bare * / + never crosses these tokens
-    layer NAME [strict]:          # layers run in order, each to a fixpoint
+    layer NAME [strict] [ordered]:  # layers run in order, each to a fixpoint
+                                  # ordered: first matching rule wins (PEG-style);
+                                  # default: longest match, ties -> earlier rule
       type/label:  pattern        # rule: rewrites a matched slice into ONE token
       operators RESULT over T1 T2 # operator table, levels LOW priority -> HIGH
         left "+" "-", right "**", prefix "-", postfix "++", nonassoc "<",
         chain "<" ">" "==", apply
+    layer NAME peg:               # PEG layer: rules call each other by name (top-down,
+                                  # packrat-memoized); committed choice, possessive repeats,
+                                  # first rule = entry. Same-name rules = ordered alternatives.
     recover:                      # see recover.py
       name: pattern => "message with {captures}"
 
@@ -38,11 +43,25 @@ from .tokens import Tok
 
 sys.setrecursionlimit(50000)
 INF = 10 ** 9
+_BUSY = object()
+_MISS = object()
+
+
+class CutFail(Exception):
+    """Raised when a sequence fails after `~`: the enclosing alternative list gives up."""
+
+
+class LR:
+    """Left-recursion record: the current seed of a leader rule at one position."""
+    __slots__ = ("seed", "hit")
+
+    def __init__(s):
+        s.seed, s.hit = None, False
 
 
 # ═════════════════════════════ pattern language ═════════════════════════════
 PT = re.compile(r'("(?:[^"\\]|\\.)*")|(\\.)|(_(?!\w))|([A-Za-z]\w*)|(\d+)'
-                r'|(=>|\*\?|\+\?|[=|()*+?&!{}<>,\-/%])')
+                r'|(=>|\*\?|\+\?|[=|()*+?&!{}<>,\-/%~])')
 KINDS = {1: "str", 2: "esc", 3: "ws", 4: "id", 5: "int", 6: "op"}
 
 
@@ -220,6 +239,8 @@ class PatParser:
                 return n
             if v in ("&", "!"):
                 return ("look", s.atom(), v == "&")
+            if v == "~":                              # cut: commit to the current alternative
+                return ("cut",)
             if v == "<":
                 return s.bal()
         raise SyntaxError(f"pattern: unexpected {v!r}")
@@ -257,8 +278,9 @@ class OpSpec:
 
 
 class Layer:
-    def __init__(s, name, strict):
-        s.name, s.strict, s.steps = name, strict, []
+    def __init__(s, name, strict, ordered=False, peg=False):
+        s.name, s.strict, s.ordered, s.steps = name, strict, ordered, []
+        s.peg, s.peg_rules, s.peg_entry = peg, {}, None
 
 
 class Grammar:
@@ -277,7 +299,10 @@ class Grammar:
             body = text[m.end(): ms[i + 1].start() if i + 1 < len(ms) else len(text)]
             if head.startswith("layer") and not head.startswith("layers"):
                 w = head[:-1].split()
-                cur = Layer(w[1], "strict" in w[2:])
+                bad = set(w[2:]) - {"strict", "ordered", "peg"}
+                if bad:
+                    raise SyntaxError(f"layer {w[1]!r}: unknown flag(s) {sorted(bad)}")
+                cur = Layer(w[1], "strict" in w[2:], "ordered" in w[2:], "peg" in w[2:])
                 s.layers.append(cur)
                 section = "layer"
             elif head.startswith("names"):
@@ -299,6 +324,8 @@ class Grammar:
             elif cur is None:
                 raise SyntaxError(f"rule outside any layer: {head!r}")
             elif head.startswith("operators"):
+                if cur.peg:
+                    raise SyntaxError(f"layer {cur.name!r}: operator tables are not allowed in peg layers")
                 w = head.split()
                 spec = OpSpec(w[1], w[3:], s.levels(body))
                 s.coerce[spec.result] = spec.operands
@@ -306,9 +333,46 @@ class Grammar:
             else:
                 name, _, label = head[:-1].strip().partition("/")
                 pat = PatParser(lex_pat(body), not cur.strict).rule()
+                if cur.peg:
+                    s.check_peg(pat, name)
+                    cur.peg_rules.setdefault(name, []).append((label or None, pat))
+                    cur.peg_entry = cur.peg_entry or name
+                    continue
                 if not cur.steps or cur.steps[-1][0] != "rules":
                     cur.steps.append(("rules", []))
                 cur.steps[-1][1].append(Rule(name, label or None, pat))
+
+        for layer in s.layers:                       # peg layers: bare rule names become calls
+            if layer.peg:
+                if not layer.peg_rules:
+                    raise SyntaxError(f"peg layer {layer.name!r} has no rules")
+                names = set(layer.peg_rules)
+                layer.peg_rules = {k: [(lb, s.resolve_calls(p, names)) for lb, p in v]
+                                   for k, v in layer.peg_rules.items()}
+                analyze_peg(layer)
+                layer.steps = [("peg", layer)]
+
+    @staticmethod
+    def check_peg(n, name):
+        if isinstance(n, tuple):
+            if (n[0] == "rep" and not n[4]) or (n[0] == "any" and not n[2]):
+                raise SyntaxError(f"peg rule {name!r}: lazy quantifiers are not PEG; "
+                                  "use a predicate (!X) or a bottom-up layer")
+            for x in n[1:]:
+                Grammar.check_peg(x, name)
+        elif isinstance(n, list):
+            for x in n:
+                Grammar.check_peg(x, name)
+
+    @staticmethod
+    def resolve_calls(n, names):
+        if isinstance(n, tuple):
+            if len(n) == 2 and n[0] == "tok" and isinstance(n[1], str) and n[1] in names:
+                return ("call", n[1])
+            return tuple(Grammar.resolve_calls(x, names) for x in n)
+        if isinstance(n, list):
+            return [Grammar.resolve_calls(x, names) for x in n]
+        return n
 
     @staticmethod
     def strip_comments(t):
@@ -349,12 +413,200 @@ class Grammar:
         return out
 
 
+
+# ═════════════════════════════ static analysis of peg layers ═════════════════════════════
+def pat_nullable(n, nullable):
+    t = n[0]
+    if t in ("skip", "look", "cut", "cnt"):
+        return True
+    if t == "call":
+        return n[1] in nullable
+    if t == "rep":
+        return n[2] == 0 or pat_nullable(n[1], nullable)
+    if t == "alt":
+        return any(pat_nullable(x, nullable) for x in n[1])
+    if t == "seq":
+        return all(pat_nullable(x, nullable) for x in n[1])
+    if t == "cap":
+        return pat_nullable(n[2], nullable)
+    if t == "any":
+        return n[1] == 0
+    return False
+
+
+def pat_first(n, nullable, rfirst):
+    """-> (descriptor set or None for 'unknown', nullable). Descriptors: ('lit', text) / ('tok', name)."""
+    t = n[0]
+    if t == "lit":
+        return {("lit", n[1])}, False
+    if t == "tok":
+        return {("tok", n[1])}, False
+    if t == "call":
+        f = rfirst.get(n[1], set())
+        return (None if f is None else set(f)), n[1] in nullable
+    if t in ("skip", "cut", "look"):
+        return set(), True
+    if t == "ws":
+        return None, False
+    if t == "any":
+        return None, n[1] == 0
+    if t == "bal":
+        return pat_first(n[1], nullable, rfirst)[0], False
+    if t == "cap":
+        return pat_first(n[2], nullable, rfirst)
+    if t in ("rep", "cnt"):
+        f, nu = pat_first(n[1], nullable, rfirst)
+        return f, nu or t == "cnt" or n[2] == 0
+    if t == "alt":
+        acc, nu = set(), False
+        for x in n[1]:
+            f, nx = pat_first(x, nullable, rfirst)
+            nu = nu or nx
+            acc = None if (acc is None or f is None) else acc | f
+        return acc, nu
+    if t == "seq":
+        acc = set()
+        for x in n[1]:
+            f, nx = pat_first(x, nullable, rfirst)
+            if f is None:
+                return None, pat_nullable(n, nullable)
+            acc |= f
+            if not nx:
+                return acc, False
+        return acc, True
+    return None, False
+
+
+def pat_left(n, nullable):
+    """Rules that can be called at the very same input position (left-call edges)."""
+    t = n[0]
+    if t == "call":
+        return {n[1]}
+    if t == "alt":
+        return set().union(*(pat_left(x, nullable) for x in n[1])) if n[1] else set()
+    if t == "seq":
+        acc = set()
+        for x in n[1]:
+            acc |= pat_left(x, nullable)
+            if not pat_nullable(x, nullable):
+                break
+        return acc
+    if t in ("rep", "cnt", "look"):
+        return pat_left(n[1], nullable)
+    if t == "cap":
+        return pat_left(n[2], nullable)
+    return set()
+
+
+def analyze_peg(layer):
+    """Fills layer.peg_run / peg_first / peg_leaders / peg_nomemo."""
+    rules = layer.peg_rules
+    nullable, changed = set(), True
+    while changed:
+        changed = False
+        for name, alts in rules.items():
+            if name not in nullable and any(pat_nullable(p, nullable) for _, p in alts):
+                nullable.add(name)
+                changed = True
+    rfirst, changed = {k: set() for k in rules}, True
+    while changed:
+        changed = False
+        for name, alts in rules.items():
+            acc = rfirst[name]
+            for _, p in alts:
+                f, _nu = pat_first(p, nullable, rfirst)
+                if f is None:
+                    acc = None
+                    break
+                acc = acc | f
+            if acc is None and rfirst[name] is not None or (acc is not None and acc != rfirst[name]):
+                rfirst[name] = acc
+                changed = True
+
+    def spec(f, nu):
+        if f is None or nu:
+            return None
+        return (frozenset(x[1] for x in f if x[0] == "lit"),
+                frozenset(x[1] for x in f if x[0] == "tok"))
+
+    layer.peg_run = {}
+    for name, alts in rules.items():
+        run = []
+        for label, p in alts:
+            f, nu = pat_first(p, nullable, rfirst)
+            run.append((label, p, spec(f, nu)))
+        layer.peg_run[name] = run
+    layer.peg_first = {name: spec(rfirst[name], name in nullable) for name in rules}
+    # left recursion: graph, SCCs, then leaders = a feedback vertex set of every SCC
+    graph = {name: set().union(*(pat_left(p, nullable) for _, p in alts)) & set(rules)
+             for name, alts in rules.items()}
+    index, low, on, stack, sccs, counter = {}, {}, set(), [], [], [0]
+
+    def strong(v):
+        index[v] = low[v] = counter[0]
+        counter[0] += 1
+        stack.append(v)
+        on.add(v)
+        for w in graph[v]:
+            if w not in index:
+                strong(w)
+                low[v] = min(low[v], low[w])
+            elif w in on:
+                low[v] = min(low[v], index[w])
+        if low[v] == index[v]:
+            comp = set()
+            while True:
+                w = stack.pop()
+                on.discard(w)
+                comp.add(w)
+                if w == v:
+                    break
+            sccs.append(comp)
+
+    for v in rules:
+        if v not in index:
+            strong(v)
+    leaders, nomemo = set(), set()
+    order = list(rules)
+    for comp in sccs:
+        if len(comp) == 1 and next(iter(comp)) not in graph[next(iter(comp))]:
+            continue
+        mine = set()
+        while True:                                       # find a cycle avoiding chosen leaders
+            color, found = {}, []
+
+            def dfs(v, path):
+                color[v] = 1
+                path.append(v)
+                for w in sorted(graph[v] & comp, key=order.index):
+                    if w in mine:
+                        continue
+                    if color.get(w) == 1:
+                        found.append(w)
+                        return True
+                    if w not in color and dfs(w, path):
+                        return True
+                path.pop()
+                color[v] = 2
+                return False
+
+            for v in sorted(comp, key=order.index):
+                if v not in mine and v not in color and dfs(v, []):
+                    break
+            if not found:
+                break
+            mine.add(found[0])
+        leaders |= mine
+        nomemo |= comp - mine
+    layer.peg_leaders, layer.peg_nomemo = leaders, nomemo
+
+
 # ═════════════════════════════ runtime structures ═════════════════════════════
 class Cell:
-    __slots__ = ("tok", "prv", "nxt")
+    __slots__ = ("tok", "prv", "nxt", "i")
 
     def __init__(s, tok, prv=None, nxt=None):
-        s.tok, s.prv, s.nxt = tok, prv, nxt
+        s.tok, s.prv, s.nxt, s.i = tok, prv, nxt, 0
 
 
 class DList:
@@ -362,9 +614,10 @@ class DList:
 
     def __init__(s, toks):
         s.head, s.tail = Cell(None), Cell(Tok("EOF"))
-        p = s.head
-        for t in toks:
+        p, s.head.i, s.tail.i = s.head, -1, 10 ** 9
+        for idx, t in enumerate(toks):
             c = Cell(t, p)
+            c.i = idx
             p.nxt = c
             p = c
         p.nxt, s.tail.prv = s.tail, p
@@ -378,6 +631,7 @@ class DList:
 
     def replace(s, a, b, tok):
         c = Cell(tok, a.prv, b.nxt)
+        c.i = a.i
         a.prv.nxt = c
         b.nxt.prv = c
         return c
@@ -476,8 +730,12 @@ class Engine:
                 while True:
                     changed = False
                     for kind, obj in layer.steps:
-                        changed |= (self.apply_rules(dl, obj) if kind == "rules"
-                                    else self.apply_ops(dl, obj))
+                        if kind == "rules":
+                            changed |= self.apply_rules(dl, obj, layer.ordered)
+                        elif kind == "peg":
+                            changed |= self.apply_peg(dl, obj)
+                        else:
+                            changed |= self.apply_ops(dl, obj)
                     if not changed:
                         break
                 if scope.commit():              # the table changes only between layers
@@ -520,8 +778,10 @@ class Engine:
                     c.tok = t2
             c = c.nxt
 
-    # ---------- rules: leftmost, longest across rules, tie -> earlier rule ----------
-    def apply_rules(self, dl, rules):
+    # ---------- rules ----------
+    # Default: leftmost position; among rules matching there the one consuming the most
+    # cells wins, ties go to the earlier rule. `ordered`: the first rule that matches wins.
+    def apply_rules(self, dl, rules, ordered=False):
         changed = False
         while True:
             did, c = False, dl.head.nxt
@@ -538,6 +798,8 @@ class Engine:
                         if best is None or n > best[0]:
                             best = (n, r, e, kids, items, env)
                         break                    # first yield = preferred inner choice
+                    if ordered and best is not None:
+                        break                    # PEG-style: first matching rule wins
                 if best is None:
                     c = c.nxt
                     continue
@@ -551,7 +813,15 @@ class Engine:
             if not did:
                 return changed
 
-    def fields(self, items):
+    @staticmethod
+    def decls(items):
+        out = []
+        for name, val, cls in klist(items):
+            if cls:
+                out += [(tk.text, cls) for tk in (val if isinstance(val, list) else [val])]
+        return out
+
+    def fields(self, items, declare=True):
         f, owned = {}, set()
         for name, val, cls in klist(items):
             vals = val if isinstance(val, list) else [val]
@@ -562,7 +832,7 @@ class Engine:
                 f[name].extend(vals)
             else:
                 f[name] = val
-            if cls:
+            if cls and declare:
                 for tk in vals:
                     self.scope.pending[tk.text] = cls
         return f
@@ -633,6 +903,8 @@ class Engine:
                 seg = [x for x in klist(kd, k0) if x.type != "_"]
                 val = seg[0] if len(seg) == 1 and sub[0] not in ("rep", "cnt") else seg
                 yield e, kd, K(it, (name, val, cls)), en
+        elif t == "cut":
+            yield c, kids, items, env                 # only meaningful in peg layers
         elif t == "look":
             if any(True for _ in self.m(n[1], c, None, None, env)) == n[2]:
                 yield c, kids, items, env
@@ -729,7 +1001,7 @@ class Engine:
                 seg.append(x.tok)
                 x = x.nxt
 
-    def bal(self, n, c, kids, items, env):
+    def bal(self, n, c, kids, items, env, matcher=None):
         """<OPEN inner CLOSE>: find the matching CLOSE, reduce what lies between as an
         isolated run, then match `inner` against the reduced tokens (full coverage)."""
         _, op, inner, cl = n
@@ -754,10 +1026,214 @@ class Engine:
         if red is None:
             return
         dl = DList(red)
-        for e, k2, i2, e2 in self.m(inner, dl.head.nxt, None, None, env):
+        for e, k2, i2, e2 in (matcher or self.m)(inner, dl.head.nxt, None, None, env):
             if e.nxt is None:                     # inner covered everything
                 yield x.nxt, K(kext(K(kids, c.tok), klist(k2)), x.tok), kext(items, klist(i2)), e2
                 return
+
+
+    # ═════════════ PEG layers: top-down, deterministic, packrat ═════════════
+    # Every expression returns at most one result (no backtracking into earlier elements):
+    # ordered choice commits, repetition is possessive, `~` aborts the alternative list.
+    # Rule calls are memoized per (rule, position); left recursion grows a seed (Warth et al.)
+    # at statically chosen leader rules; FIRST sets prune calls that cannot match.
+    def apply_peg(self, dl, layer):
+        saved = (getattr(self, "pmemo", None), getattr(self, "pegrules", None),
+                 getattr(self, "pdecls", None), getattr(self, "pfirst", None),
+                 getattr(self, "pleaders", None), getattr(self, "pnomemo", None))
+        self.pmemo, self.pegrules, self.pdecls = {}, layer.peg_run, {}
+        self.pfirst, self.pleaders, self.pnomemo = layer.peg_first, layer.peg_leaders, layer.peg_nomemo
+        try:
+            if dl.head.nxt is dl.tail:                      # empty input: the entry rule may be nullable
+                r = self.pcall(layer.peg_entry, dl.tail)
+                if r is None:
+                    return False
+                cell = Cell(r[1], dl.head, dl.tail)
+                dl.head.nxt = dl.tail.prv = cell
+                return True
+            changed = False
+            while True:
+                did, c = False, dl.head.nxt
+                while c.nxt is not None:
+                    if c.tok.type != "_":
+                        r = self.pcall(layer.peg_entry, c)
+                        if r is not None and r[0] is not c:
+                            e, node = r
+                            if not (len(node.kids) == 1 and node.kids[0].type == node.type):
+                                self.apply_decls(node)
+                                c = dl.replace(c, e.prv, node)
+                                self.pmemo.clear()
+                                self.pdecls.clear()
+                                did = changed = True
+                    c = c.nxt
+                if not did:
+                    return changed
+        finally:
+            (self.pmemo, self.pegrules, self.pdecls, self.pfirst,
+             self.pleaders, self.pnomemo) = saved
+
+    def apply_decls(self, node):
+        stack = [node]
+        while stack:
+            x = stack.pop()
+            for text, cls in self.pdecls.get(id(x), ()):
+                self.scope.pending[text] = cls
+            stack.extend(k for k in x.kids if k.kids)
+
+    @staticmethod
+    def first_ok(spec, tk):
+        return ((not tk.kids and tk.text in spec[0]) or tk.type in spec[1]
+                or (tk.cls is not None and tk.cls in spec[1]))
+
+    def pcall(self, name, c):
+        spec = self.pfirst[name]
+        if spec is not None and not self.first_ok(spec, c.tok):
+            return None
+        if name in self.pnomemo:                        # member of a left-recursive cycle
+            return self.peval(name, c)
+        key, memo = (name, id(c)), self.pmemo
+        v = memo.get(key, _MISS)
+        if v is not _MISS:
+            if v is _BUSY:
+                raise SyntaxError(f"left recursion in peg rule {name!r} could not be resolved")
+            if type(v) is LR:
+                v.hit = True
+                return v.seed
+            return v
+        if name in self.pleaders:
+            lr = memo[key] = LR()
+            res = self.peval(name, c)
+            if lr.hit:
+                while res is not None:                  # grow the seed until it stops growing
+                    lr.seed = res
+                    r2 = self.peval(name, c)
+                    if r2 is None or r2[0].i <= res[0].i:
+                        break
+                    res = r2
+            memo[key] = res
+            return res
+        memo[key] = _BUSY
+        res = memo[key] = self.peval(name, c)
+        return res
+
+    def peval(self, name, c):
+        tk = c.tok
+        for label, pat, spec in self.pegrules[name]:
+            if spec is not None and not self.first_ok(spec, tk):
+                continue
+            try:
+                r = self.pm(pat, c, None, None, {})
+            except CutFail:
+                return None
+            if r is None:
+                continue
+            e, kids, items, env = r
+            kl = klist(kids)
+            f = self.fields(items, declare=False)
+            if kl:
+                node = self.mknode(name, label, kl, f, env)
+            else:                                       # empty match
+                node = Tok(name, "", tk.pos, tk.line, tk.col, (), label, f)
+                node.params = env
+            d = self.decls(items)
+            if d:
+                self.pdecls[id(node)] = d
+            return e, node
+        return None
+
+    def pm_gen(self, n, c, kids, items, env):
+        r = self.pm(n, c, kids, items, env)
+        if r is not None:
+            yield r
+
+    def prep(self, sub, c, kids, items, env, lo, hi, sep):
+        k, cur = 0, (c, kids, items, env)
+        while k < hi:
+            cc, kk = cur[0], cur[1]
+            if sep and k > 0 and cc.nxt is not None and cc.tok.type == "_":
+                cc, kk = cc.nxt, K(kk, cc.tok)
+            r = self.pm(sub, cc, kk, cur[2], cur[3])
+            if r is None or r[0] is cc:                 # failed / no progress
+                break
+            cur, k = r, k + 1
+        return cur + (k,) if k >= lo else None
+
+    def pm(self, n, c, kids, items, env):
+        """Deterministic matcher: one result tuple (cell, kids, items, env) or None."""
+        t = n[0]
+        if t == "call":
+            r = self.pcall(n[1], c)
+            return None if r is None else (r[0], K(kids, r[1]), items, env)
+        if t == "tok":
+            tk = c.tok
+            if (tk.type == n[1] or tk.cls == n[1]) and (len(n) < 3 or tk.label == n[2]):
+                return (c, kids, items, env) if c.nxt is None else (c.nxt, K(kids, tk), items, env)
+            return None
+        if t == "lit":
+            tk = c.tok
+            if c.nxt is not None and tk.text == n[1] and not tk.kids:
+                return c.nxt, K(kids, tk), items, env
+            return None
+        if t == "seq":
+            cut = False
+            for x in n[1]:
+                if x[0] == "cut":
+                    cut = True
+                    continue
+                r = self.pm(x, c, kids, items, env)
+                if r is None:
+                    if cut:
+                        raise CutFail
+                    return None
+                c, kids, items, env = r
+            return c, kids, items, env
+        if t == "alt":
+            for a in n[1]:
+                try:
+                    r = self.pm(a, c, kids, items, env)
+                except CutFail:
+                    return None
+                if r is not None:
+                    return r
+            return None
+        if t == "cut":
+            return c, kids, items, env
+        if t == "rep":
+            r = self.prep(n[1], c, kids, items, env, n[2], n[3], n[5])
+            return None if r is None else r[:4]
+        if t == "cnt":
+            _, sub, (var, cc), sep = n
+            bound = var is None or var in env
+            if bound:
+                want = cc if var is None else env[var] + cc
+                if want < 0:
+                    return None
+                r = self.prep(sub, c, kids, items, env, want, want, sep)
+            else:
+                r = self.prep(sub, c, kids, items, env, 1, INF, sep)
+            if r is None:
+                return None
+            if bound:
+                return r[:4]
+            if r[4] - cc < 1:
+                return None
+            return r[0], r[1], r[2], {**r[3], var: r[4] - cc}
+        if t == "cap":
+            _, name, sub, cls = n
+            k0 = klen(kids)
+            r = self.pm(sub, c, kids, items, env)
+            if r is None:
+                return None
+            e, kd, it, en = r
+            seg = [x for x in klist(kd, k0) if x.type != "_"]
+            val = seg[0] if len(seg) == 1 and sub[0] not in ("rep", "cnt") else seg
+            return e, kd, K(it, (name, val, cls)), en
+        if t == "look":
+            ok = self.pm(n[1], c, None, None, env) is not None
+            return (c, kids, items, env) if ok == n[2] else None
+        if t == "bal":
+            return next(self.bal(n, c, kids, items, env, matcher=self.pm_gen), None)
+        return next(self.m(n, c, kids, items, env), None)     # skip / ws / any
 
     # ---------- operator tables ----------
     @staticmethod

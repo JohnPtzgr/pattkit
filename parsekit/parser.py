@@ -75,6 +75,68 @@ class Parser:
                 return fixed, diag
         return None, diag
 
+    @staticmethod
+    def _lint_peg(layer):
+        """Rules unreachable from the entry rule (left recursion is supported)."""
+        rules, out = layer.peg_rules, []
+
+        def nullable(n):
+            t = n[0]
+            if t in ("skip", "look"):
+                return True
+            if t == "rep":
+                return n[2] == 0 or nullable(n[1])
+            if t == "alt":
+                return any(nullable(x) for x in n[1])
+            if t == "seq":
+                return all(nullable(x) for x in n[1])
+            if t == "cap":
+                return nullable(n[2])
+            return False
+
+        def first(n):
+            t = n[0]
+            if t == "call":
+                return {n[1]}
+            if t == "alt":
+                return set().union(*(first(x) for x in n[1]))
+            if t == "seq":
+                acc = set()
+                for x in n[1]:
+                    acc |= first(x)
+                    if not nullable(x):
+                        break
+                return acc
+            if t in ("rep", "cnt"):
+                return first(n[1])
+            if t == "cap":
+                return first(n[2])
+            return set()
+
+        def calls(n, acc):
+            if isinstance(n, tuple):
+                if n and n[0] == "call":
+                    acc.add(n[1])
+                for x in n[1:]:
+                    calls(x, acc)
+            elif isinstance(n, list):
+                for x in n:
+                    calls(x, acc)
+
+        reach, todo = set(), [layer.peg_entry]
+        while todo:
+            r = todo.pop()
+            if r in reach:
+                continue
+            reach.add(r)
+            acc = set()
+            for _, p in rules[r]:
+                calls(p, acc)
+            todo.extend(acc & set(rules))
+        out += [f"peg layer {layer.name}: rule {r!r} is unreachable from entry rule "
+                f"{layer.peg_entry!r}" for r in sorted(set(rules) - reach)]
+        return out
+
     # ---------------- static checks ----------------
     def lint(self):
         """Grammar warnings: unknown token/rule names, literals the lexer can never produce
@@ -102,6 +164,11 @@ class Parser:
                     for r in obj:
                         rule_types.add(r.type)
                         collect(r.pat)
+                elif kind == "peg":
+                    rule_types |= set(obj.peg_rules)
+                    for alts in obj.peg_rules.values():
+                        for _, pat in alts:
+                            collect(pat)
                 else:
                     rule_types.add(obj.result)
         known = None if produced is None else produced | rule_types | classes
@@ -121,6 +188,8 @@ class Parser:
                 visit(n[1], where)
             elif t == "cap":
                 visit(n[2], where)
+            elif t == "call":
+                consumed.add(n[1])
             elif t == "any" and n[3]:
                 consumed.add(n[3])
                 if known is not None and n[3] not in known:
@@ -134,6 +203,12 @@ class Parser:
                 if kind == "rules":
                     for r in obj:
                         visit(r.pat, f"layer {layer.name}, rule {r.type}")
+                elif kind == "peg":
+                    consumed.add(obj.peg_entry)
+                    for rname, alts in obj.peg_rules.items():
+                        for _, pat in alts:
+                            visit(pat, f"peg layer {layer.name}, rule {rname}")
+                    warns += self._lint_peg(obj)
                 else:
                     consumed |= obj.operands
                     for _, ops in obj.levels:
@@ -151,6 +226,26 @@ class Parser:
                     got = "nothing lexable" if ts is None else [t.text for t in ts]
                     warns.append(f"{where}: literal {text!r} can never match; "
                                  f"the lexer produces {got} for it")
+        def flat(pat):
+            items = pat[1] if pat[0] == "seq" else [pat]
+            return [x for x in items if x != ("skip",)]
+
+        for layer in g.layers:
+            for kind, obj in layer.steps:
+                if kind != "rules":
+                    continue
+                for i, b in enumerate(obj):
+                    fb = flat(b.pat)
+                    for a in obj[:i]:
+                        fa = flat(a.pat)
+                        if fa == fb:
+                            warns.append(f"layer {layer.name}: rule {b.type!r} duplicates earlier "
+                                         f"rule {a.type!r} and can never fire")
+                            break
+                        if layer.ordered and len(fa) < len(fb) and fb[:len(fa)] == fa:
+                            warns.append(f"layer {layer.name} (ordered): rule {b.type!r} is shadowed "
+                                         f"by earlier rule {a.type!r}, which matches a prefix of it")
+                            break
         for name in sorted(rule_types - consumed):
             warns.append(f"rule {name!r} is produced but never used")
         return warns
